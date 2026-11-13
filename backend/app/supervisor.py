@@ -48,7 +48,8 @@ from .schemas import (
 
 
 BACKOFF_SECONDS = (1, 2, 5, 10, 20, 30, 60)
-TRANSIENT_STATES = {"target_unreachable", "ssh_unreachable", "reconnecting"}
+NETWORK_WAIT_STATES = {"target_unreachable", "ssh_unreachable"}
+TRANSIENT_STATES = NETWORK_WAIT_STATES | {"reconnecting", "port_conflict"}
 
 
 def utc_now() -> datetime:
@@ -164,6 +165,17 @@ class TunnelSupervisor:
                 runtime.reconnect_count += 1
             if previous != "connected" or runtime.stable_since is None:
                 runtime.stable_since = utc_now()
+            if runtime.managed and runtime.ssh_pid is not None and runtime.remote_listener.found:
+                listener_pids = ", ".join(map(str, runtime.remote_listener.pids)) or "未知"
+                runtime.checks = [
+                    check.model_copy(update={
+                        "state": "ok",
+                        "detail": f"受管 SSH 运行中，远端监听已建立；PID {listener_pids}",
+                    })
+                    if check.key == "remote_listener" and check.state == "warn"
+                    else check
+                    for check in runtime.checks
+                ]
         else:
             runtime.stable_since = None
         if error is not None:
@@ -280,6 +292,7 @@ class TunnelSupervisor:
                 )
             if manual:
                 self._set_manually_stopped(tunnel_id, False)
+                tunnel.manually_stopped = False
             record = self._records.get(tunnel_id)
             if record is not None and verify_record(record):
                 self._process_fields(runtime, record)
@@ -298,8 +311,19 @@ class TunnelSupervisor:
         tunnel_id = tunnel.id
         runtime = self._runtime(tunnel_id)
         self._active.add(tunnel_id)
+        runtime.external_tunnel = False
+        runtime.next_retry_at = None
         self._transition(runtime, "starting", activity="正在执行启动前检查")
-        snapshot = await self.diagnostics.run(tunnel)
+        try:
+            snapshot = await self.diagnostics.run(tunnel)
+        except OSError as exc:
+            self._transition(runtime, "error", error=str(exc), activity="启动检查失败，等待重试")
+            self._schedule_retry(tunnel, str(exc))
+            return StartResponse(
+                started=False,
+                message=f"启动检查失败：{redact_text(str(exc))}",
+                runtime=runtime.model_copy(deep=True),
+            )
         self._apply_snapshot(runtime, snapshot)
 
         autossh_check = snapshot.check("autossh")
@@ -309,17 +333,27 @@ class TunnelSupervisor:
             self._transition(runtime, "error", error=autossh_check.detail, activity="缺少 autossh")
             return StartResponse(started=False, message=autossh_check.detail, runtime=runtime.model_copy(deep=True))
 
+        forwarding_check = snapshot.check("ssh_forwarding")
+        if forwarding_check is not None and forwarding_check.state == "fail":
+            self._active.discard(tunnel_id)
+            self._transition(
+                runtime, "error", error=forwarding_check.detail, activity="请修正 SSH 别名配置后重新启动"
+            )
+            return StartResponse(
+                started=False, message=forwarding_check.detail, runtime=runtime.model_copy(deep=True)
+            )
+
         if self._target_unreachable(snapshot):
             self._transition(
                 runtime,
                 "target_unreachable",
-                error="OpenVPN 或目标数据库网络不可达",
+                error="VPN 或目标服务网络不可达",
                 activity="正在等待目标网络恢复",
             )
             self._schedule_retry(tunnel, "目标网络不可达")
             return StartResponse(
                 started=False,
-                message="目标数据库不可达，隧道未启动",
+                message="目标服务不可达，隧道未启动",
                 runtime=runtime.model_copy(deep=True),
             )
 
@@ -340,6 +374,13 @@ class TunnelSupervisor:
 
         auth_check = snapshot.check("ssh_auth")
         if auth_check is not None and auth_check.state == "fail":
+            if snapshot.ssh_failure_retryable:
+                self._retry_ssh_failure(tunnel, auth_check.detail)
+                return StartResponse(
+                    started=False,
+                    message=runtime.last_error or "SSH 连接暂时失败，等待重试",
+                    runtime=runtime.model_copy(deep=True),
+                )
             self._active.discard(tunnel_id)
             runtime.next_retry_at = None
             self._transition(runtime, "error", error=auth_check.detail, activity="SSH 认证失败")
@@ -360,42 +401,10 @@ class TunnelSupervisor:
             )
 
         if snapshot.remote_listener.found:
-            runtime.external_tunnel = True
-            runtime.conflict = self._conflict_payload(snapshot, "远端端口已有监听")
-            if not snapshot.end_to_end_known:
-                self._active.discard(tunnel_id)
-                runtime.next_retry_at = None
-                self._transition(
-                    runtime,
-                    "error",
-                    error="远端端口已有监听，但无法执行端到端探测",
-                    activity="未启动第二个 autossh，请检查远端探测工具",
-                )
-                return StartResponse(
-                    started=False,
-                    message="无法确认现有远端监听，隧道未启动",
-                    runtime=runtime.model_copy(deep=True),
-                )
-            if snapshot.end_to_end_ok:
-                runtime.next_retry_at = None
-                self._active.add(tunnel_id)
-                self._transition(runtime, "connected", activity="检测到已有健康隧道")
-                return StartResponse(
-                    started=False,
-                    message="已有健康隧道，未启动第二个 autossh",
-                    runtime=runtime.model_copy(deep=True),
-                )
-            self._active.discard(tunnel_id)
-            runtime.next_retry_at = None
-            self._transition(
-                runtime,
-                "port_conflict",
-                error="远端端口被占用，端到端探测失败，疑似残留隧道",
-                activity="已暂停自动重试，请检查并人工确认清理",
-            )
+            self._unmanaged_listener(tunnel, snapshot)
             return StartResponse(
                 started=False,
-                message="远端端口冲突，疑似残留隧道",
+                message=runtime.last_error or "远端端口已被非受管会话占用",
                 runtime=runtime.model_copy(deep=True),
             )
 
@@ -426,15 +435,66 @@ class TunnelSupervisor:
             runtime=runtime.model_copy(deep=True),
         )
 
+    def _unmanaged_listener(self, tunnel: Tunnel, snapshot: DiagnosticSnapshot) -> None:
+        runtime = self._runtime(tunnel.id)
+        runtime.external_tunnel = False
+        self._process_fields(runtime, None)
+        runtime.conflict = self._conflict_payload(snapshot, "远端端口已被非受管会话占用")
+        if not snapshot.end_to_end_known:
+            error = "远端端口已有非受管监听，但无法执行 TCP 监听探测"
+            self._transition(runtime, "error", error=error, activity="未复用未知监听，等待重新检查")
+            self._schedule_retry(tunnel, error)
+            return
+        error = (
+            "远端端口已被非受管会话占用；TCP 可达不能确认转发目标，未复用该监听"
+            if snapshot.end_to_end_ok
+            else "远端端口已被非受管会话占用，TCP 监听探测失败"
+        )
+        self._enter_port_conflict(tunnel, error)
+
+    def _enter_port_conflict(self, tunnel: Tunnel, error: str) -> None:
+        runtime = self._runtime(tunnel.id)
+        runtime.external_tunnel = False
+        runtime.conflict = runtime.conflict or {"message": error}
+        if tunnel.manually_stopped:
+            activity = "已手动停止，自动连接已暂停"
+        elif not tunnel.auto_reconnect:
+            activity = "自动重连已关闭，请检查远端端口"
+        else:
+            activity = "等待远端端口释放，将自动重试"
+        self._transition(runtime, "port_conflict", error=error, activity=activity)
+        self._schedule_retry(tunnel, error)
+
+    def _retry_ssh_failure(self, tunnel: Tunnel, detail: str) -> None:
+        runtime = self._runtime(tunnel.id)
+        managed = tunnel.id in self._records
+        retry_enabled = tunnel.auto_reconnect and not tunnel.manually_stopped
+        self._transition(
+            runtime,
+            "reconnecting",
+            error=f"SSH 连接暂时失败：{detail}",
+            activity=(
+                "SSH 诊断暂时失败，保留受管 autossh 并重新检查"
+                if managed
+                else "等待退避后自动重试 SSH 连接" if retry_enabled else "自动连接已暂停"
+            ),
+        )
+        if managed and not tunnel.auto_reconnect and not tunnel.manually_stopped:
+            runtime.next_retry_at = utc_now() + timedelta(seconds=self.settings.monitor_interval)
+            self._publish_runtime(tunnel.id)
+        else:
+            self._schedule_retry(tunnel, runtime.last_error or detail)
+
     def _schedule_retry(self, tunnel: Tunnel, reason: str) -> None:
-        if not tunnel.auto_reconnect:
+        runtime = self._runtime(tunnel.id)
+        if not tunnel.auto_reconnect or tunnel.manually_stopped:
             self._active.discard(tunnel.id)
-            self._runtime(tunnel.id).next_retry_at = None
+            runtime.next_retry_at = None
+            self._publish_runtime(tunnel.id)
             return
         attempt = self._retry_attempts.get(tunnel.id, 0)
         delay = BACKOFF_SECONDS[min(attempt, len(BACKOFF_SECONDS) - 1)]
         self._retry_attempts[tunnel.id] = attempt + 1
-        runtime = self._runtime(tunnel.id)
         runtime.next_retry_at = utc_now() + timedelta(seconds=delay)
         runtime.last_error = redact_text(reason, 1000)
         self._active.add(tunnel.id)
@@ -526,14 +586,9 @@ class TunnelSupervisor:
         self._clear_record(tunnel_id)
         self._process_fields(runtime, None)
         if had_conflict:
-            runtime.conflict = runtime.conflict or {"message": "远端监听端口冲突"}
-            self._active.discard(tunnel_id)
-            runtime.next_retry_at = None
-            self._transition(
-                runtime,
-                "port_conflict",
-                error="remote port forwarding failed：远端端口已被旧会话占用",
-                activity="已暂停自动重试，请检查远端占用",
+            self._enter_port_conflict(
+                self._get_tunnel(tunnel_id),
+                "remote port forwarding failed：远端端口已被旧会话占用",
             )
             return
         if had_auth_error:
@@ -580,6 +635,19 @@ class TunnelSupervisor:
         self._process_fields(runtime, record)
         snapshot = await self.diagnostics.run(tunnel)
         self._apply_snapshot(runtime, snapshot)
+        if conflict_in_log(log_path, record.log_offset):
+            await self._terminate_for_conflict(tunnel, record)
+            return
+        self._process_fields(runtime, record)
+        forwarding_check = snapshot.check("ssh_forwarding")
+        if forwarding_check is not None and forwarding_check.state == "fail":
+            await self._terminate_record(tunnel_id, record)
+            self._active.discard(tunnel_id)
+            runtime.next_retry_at = None
+            self._transition(
+                runtime, "error", error=forwarding_check.detail, activity="请修正 SSH 别名配置后重新启动"
+            )
+            return
         ssh_check = snapshot.check("ssh_tcp")
         auth_check = snapshot.check("ssh_auth")
         if self._target_unreachable(snapshot):
@@ -587,7 +655,7 @@ class TunnelSupervisor:
             self._transition(
                 runtime,
                 "target_unreachable",
-                error="OpenVPN 或目标数据库网络不可达",
+                error="VPN 或目标服务网络不可达",
                 activity=(
                     "已停止 autossh，等待目标网络恢复"
                     if ok
@@ -613,6 +681,9 @@ class TunnelSupervisor:
                 self._schedule_retry(tunnel, "远端 SSH 不可达")
             return
         if auth_check is not None and auth_check.state == "fail":
+            if snapshot.ssh_failure_retryable:
+                self._retry_ssh_failure(tunnel, auth_check.detail)
+                return
             await self._terminate_record(tunnel_id, record)
             runtime.next_retry_at = None
             self._active.discard(tunnel_id)
@@ -635,10 +706,18 @@ class TunnelSupervisor:
                     activity="保持当前 autossh，不使用不可靠的清理判断",
                 )
             elif snapshot.end_to_end_ok:
+                if runtime.ssh_pid is None:
+                    runtime.next_retry_at = utc_now() + timedelta(seconds=self.settings.monitor_interval)
+                    self._transition(
+                        runtime,
+                        "reconnecting",
+                        activity="autossh 尚无受管 SSH 子进程，不能确认监听属于当前隧道",
+                    )
+                    return
                 runtime.next_retry_at = None
                 runtime.external_tunnel = False
                 runtime.conflict = None
-                self._transition(runtime, "connected", activity="反向隧道连接正常")
+                self._transition(runtime, "connected", activity="受管 SSH 转发已建立；服务协议需另行验证")
             else:
                 await self._terminate_for_conflict(tunnel, record)
             return
@@ -653,15 +732,11 @@ class TunnelSupervisor:
     async def _terminate_for_conflict(self, tunnel: Tunnel, record: ProcessRecord) -> None:
         runtime = self._runtime(tunnel.id)
         ok, message = await self._terminate_record(tunnel.id, record)
-        self._active.discard(tunnel.id)
-        runtime.next_retry_at = None
         runtime.conflict = runtime.conflict or {"message": message}
-        self._transition(
-            runtime,
-            "port_conflict",
-            error="remote port forwarding failed：远端端口被旧会话占用",
-            activity="已暂停自动重试，请使用安全清理或手工命令",
-        )
+        error = "remote port forwarding failed：远端端口被旧会话占用"
+        if not ok and tunnel.id in self._records:
+            error += f"；停止 autossh 失败：{message}"
+        self._enter_port_conflict(tunnel, error)
 
     async def _terminate_record(
         self, tunnel_id: str, record: ProcessRecord
@@ -670,7 +745,7 @@ class TunnelSupervisor:
         if ok or not verify_record(record):
             self._clear_record(tunnel_id)
         runtime = self._runtime(tunnel_id)
-        self._process_fields(runtime, None)
+        self._process_fields(runtime, self._records.get(tunnel_id))
         self._publish_runtime(tunnel_id)
         return ok, message
 
@@ -719,18 +794,26 @@ class TunnelSupervisor:
             self._stop_tail(tunnel_id)
 
     async def diagnose_tunnel(self, tunnel_id: str) -> RuntimeView:
-        tunnel = self._get_tunnel(tunnel_id)
         async with self._lock(tunnel_id):
+            tunnel = self._get_tunnel(tunnel_id)
             runtime = self._runtime(tunnel_id)
             snapshot = await self.diagnostics.run(tunnel)
             self._apply_snapshot(runtime, snapshot)
+            forwarding_check = snapshot.check("ssh_forwarding")
+            if forwarding_check is not None and forwarding_check.state == "fail":
+                self._active.discard(tunnel_id)
+                runtime.next_retry_at = None
+                self._transition(
+                    runtime, "error", error=forwarding_check.detail, activity="请修正 SSH 别名配置后重新启动"
+                )
+                return runtime.model_copy(deep=True)
             ssh_check = snapshot.check("ssh_tcp")
             auth_check = snapshot.check("ssh_auth")
             if self._target_unreachable(snapshot):
                 self._transition(
                     runtime,
                     "target_unreachable",
-                    error="目标数据库不可达",
+                    error="目标服务不可达",
                     activity="诊断完成，等待网络恢复",
                 )
                 return runtime.model_copy(deep=True)
@@ -743,6 +826,9 @@ class TunnelSupervisor:
                 )
                 return runtime.model_copy(deep=True)
             if auth_check is not None and auth_check.state == "fail":
+                if snapshot.ssh_failure_retryable:
+                    self._retry_ssh_failure(tunnel, auth_check.detail)
+                    return runtime.model_copy(deep=True)
                 self._transition(
                     runtime,
                     "error",
@@ -752,6 +838,7 @@ class TunnelSupervisor:
                 return runtime.model_copy(deep=True)
             record = self._records.get(tunnel_id)
             if record is not None and verify_record(record):
+                self._process_fields(runtime, record)
                 if conflict_in_log(
                     self.settings.logs_dir / f"{tunnel_id}.log", record.log_offset
                 ):
@@ -768,40 +855,26 @@ class TunnelSupervisor:
                         error="远端端口已监听，但无法完成端到端探测",
                         activity="保持当前 autossh，未执行清理",
                     )
+                elif runtime.ssh_pid is None:
+                    self._transition(runtime, "reconnecting", activity="尚无受管 SSH 子进程，未认定监听健康")
                 elif self._snapshot_healthy(snapshot):
                     runtime.next_retry_at = None
                     self._transition(runtime, "connected", activity="诊断通过")
                 else:
                     await self._terminate_for_conflict(tunnel, record)
             elif snapshot.remote_listener.found:
-                runtime.external_tunnel = True
-                runtime.conflict = self._conflict_payload(snapshot, "远端端口已有监听")
-                if not snapshot.end_to_end_known:
-                    self._active.discard(tunnel_id)
-                    runtime.next_retry_at = None
-                    self._transition(
-                        runtime,
-                        "error",
-                        error="远端端口已监听，但无法完成端到端探测",
-                        activity="不会把无法探测误判为残留隧道",
-                    )
-                elif self._snapshot_healthy(snapshot):
-                    self._active.add(tunnel_id)
-                    runtime.next_retry_at = None
-                    self._transition(runtime, "connected", activity="检测到已有健康隧道")
-                else:
-                    self._active.discard(tunnel_id)
-                    runtime.next_retry_at = None
-                    self._transition(
-                        runtime,
-                        "port_conflict",
-                        error="远端端口已被监听，但端到端探测失败",
-                        activity="请检查远端残留会话",
-                    )
+                self._unmanaged_listener(tunnel, snapshot)
             else:
                 runtime.external_tunnel = False
                 runtime.conflict = None
-                if runtime.state != "stopped":
+                if (
+                    tunnel_id in self._active
+                    and tunnel.auto_reconnect
+                    and not tunnel.manually_stopped
+                ):
+                    runtime.next_retry_at = utc_now()
+                    self._transition(runtime, "reconnecting", activity="远端端口空闲，等待自动重连")
+                elif runtime.state != "stopped":
                     self._transition(runtime, "stopped", activity="诊断完成")
                 else:
                     self._transition(runtime, "stopped", activity="诊断完成，远端端口空闲")
@@ -817,31 +890,42 @@ class TunnelSupervisor:
         }
 
     async def preview_conflict(self, tunnel_id: str) -> ConflictPreview:
-        tunnel = self._get_tunnel(tunnel_id)
-        record = self._records.get(tunnel_id)
-        if record is not None and verify_record(record):
-            raise ConflictError("AutoSSH Desk 管理的 autossh 仍在运行，请先停止后再检查远端残留")
-        return await self.conflicts.preview(tunnel)
+        async with self._lock(tunnel_id):
+            tunnel = self._get_tunnel(tunnel_id)
+            record = self._records.get(tunnel_id)
+            if record is not None and verify_record(record):
+                raise ConflictError("AutoSSH Desk 管理的 autossh 仍在运行，请先停止后再检查远端残留")
+            return await self.conflicts.preview(tunnel)
 
     async def clean_conflict(
         self, tunnel_id: str, request: ConflictCleanRequest
     ) -> tuple[RemoteListener, str]:
-        tunnel = self._get_tunnel(tunnel_id)
-        record = self._records.get(tunnel_id)
-        if record is not None and verify_record(record):
-            raise ConflictError("AutoSSH Desk 管理的 autossh 仍在运行，不能清理远端会话")
-        listener, message = await self.conflicts.clean(
-            tunnel, request.fingerprint, request.confirm
-        )
-        runtime = self._runtime(tunnel_id)
-        runtime.conflict = None
-        runtime.remote_listener = RemoteListener(
-            found=False,
-            address=tunnel.remote_bind_host,
-            port=tunnel.remote_port,
-        )
-        self._publish_runtime(tunnel_id)
-        return listener, message
+        async with self._lock(tunnel_id):
+            tunnel = self._get_tunnel(tunnel_id)
+            record = self._records.get(tunnel_id)
+            if record is not None and verify_record(record):
+                raise ConflictError("AutoSSH Desk 管理的 autossh 仍在运行，不能清理远端会话")
+            listener, message = await self.conflicts.clean(
+                tunnel, request.fingerprint, request.confirm
+            )
+            runtime = self._runtime(tunnel_id)
+            runtime.external_tunnel = False
+            runtime.conflict = None
+            runtime.remote_listener = RemoteListener(
+                found=False,
+                address=tunnel.remote_bind_host,
+                port=tunnel.remote_port,
+            )
+            if tunnel.auto_reconnect and not tunnel.manually_stopped:
+                self._active.add(tunnel_id)
+                self._retry_attempts[tunnel_id] = 0
+                runtime.next_retry_at = utc_now()
+                self._transition(runtime, "reconnecting", activity="等待远端端口释放后自动重连")
+            else:
+                self._active.discard(tunnel_id)
+                runtime.next_retry_at = None
+                self._publish_runtime(tunnel_id)
+            return listener, message
 
     def get_log(self, tunnel_id: str) -> str:
         self._get_tunnel(tunnel_id)
@@ -967,6 +1051,13 @@ class TunnelSupervisor:
                 if not verify_record(record):
                     self._handle_process_exit(tunnel_id, record, -1)
                     return
+                if (
+                    runtime.state == "reconnecting"
+                    and runtime.next_retry_at is not None
+                    and utc_now() < runtime.next_retry_at
+                    and not force
+                ):
+                    return
                 await self._check_managed(tunnel_id, record)
                 if runtime.stable_since is not None:
                     stable_seconds = (utc_now() - runtime.stable_since).total_seconds()
@@ -976,55 +1067,24 @@ class TunnelSupervisor:
 
             if runtime.external_tunnel:
                 tunnel = self._get_tunnel(tunnel_id)
-                snapshot = await self.diagnostics.run(tunnel)
-                self._apply_snapshot(runtime, snapshot)
-                ssh_check = snapshot.check("ssh_tcp")
-                auth_check = snapshot.check("ssh_auth")
-                if self._target_unreachable(snapshot):
-                    self._transition(
-                        runtime,
-                        "target_unreachable",
-                        error="OpenVPN 或目标数据库网络不可达",
-                        activity="保持监控外部隧道，等待目标网络恢复",
-                    )
-                elif ssh_check is not None and ssh_check.state == "fail":
-                    self._transition(
-                        runtime,
-                        "ssh_unreachable",
-                        error="远端 SSH 端口不可达",
-                        activity="保持监控外部隧道，等待 SSH 网络恢复",
-                    )
-                elif auth_check is not None and auth_check.state == "fail":
-                    self._active.discard(tunnel_id)
-                    self._transition(
-                        runtime,
-                        "error",
-                        error=f"SSH 认证失败：{auth_check.detail}",
-                        activity="外部隧道无法继续诊断",
-                    )
-                elif self._snapshot_healthy(snapshot):
-                    runtime.next_retry_at = None
-                    self._transition(runtime, "connected", activity="外部健康隧道仍可用")
-                else:
-                    self._active.discard(tunnel_id)
-                    runtime.next_retry_at = None
-                    self._transition(
-                        runtime,
-                        "error",
-                        error="原先的外部健康隧道已不可用",
-                        activity="未自动接管外部隧道",
-                    )
+                runtime.external_tunnel = False
+                self._enter_port_conflict(tunnel, "此前复用的监听不属于本应用，已停止将其认定为健康隧道")
                 return
 
             if runtime.next_retry_at is None:
                 return
             tunnel = self._get_tunnel(tunnel_id)
+            if not tunnel.auto_reconnect or tunnel.manually_stopped:
+                self._active.discard(tunnel_id)
+                runtime.next_retry_at = None
+                self._publish_runtime(tunnel_id)
+                return
             if force and runtime.state in TRANSIENT_STATES:
                 runtime.next_retry_at = utc_now()
             if utc_now() >= runtime.next_retry_at:
                 await self._attempt_start(tunnel)
                 return
-            if runtime.state in TRANSIENT_STATES:
+            if runtime.state in NETWORK_WAIT_STATES:
                 network_ok = await self.diagnostics.quick_network_ok(tunnel)
                 if network_ok:
                     await self._attempt_start(tunnel)

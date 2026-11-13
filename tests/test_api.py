@@ -253,21 +253,26 @@ def test_start_preflight_states(client: TestClient, monkeypatch, scenario: str):
     runtime = body["runtime"]
     if scenario == "healthy":
         assert body["started"] is False
-        assert runtime["state"] == "connected"
-        assert runtime["external_tunnel"] is True
+        assert runtime["state"] == "port_conflict"
+        assert runtime["external_tunnel"] is False
         assert runtime["managed"] is False
+        assert runtime["next_retry_at"] is not None
     elif scenario in {"dns", "target"}:
         assert runtime["state"] == "target_unreachable"
         assert runtime["next_retry_at"] is not None
+        assert "数据库" not in runtime["last_error"]
+        assert "数据库" not in body["message"]
     elif scenario == "auth":
         assert runtime["state"] == "error"
         assert "Permission denied" in runtime["last_error"]
     elif scenario == "conflict":
         assert runtime["state"] == "port_conflict"
+        assert runtime["next_retry_at"] is not None
+        assert tunnel_id in supervisor._active
         assert body["started"] is False
     else:
         assert runtime["state"] == "error"
-        assert "无法执行端到端探测" in runtime["last_error"]
+        assert "无法执行 TCP 监听探测" in runtime["last_error"]
 
 
 def test_conflict_preview_and_clean_require_exact_confirmation(
@@ -455,20 +460,36 @@ def test_background_monitor_auto_connects_without_click(test_settings: Settings,
     app = create_app(settings)
     network_available = Event()
     connected = Event()
+    supervisor = app.state.supervisor
 
     async def fake_network(_tunnel):
         return network_available.is_set()
 
     async def fake_run(_tunnel):
+        managed = _tunnel.id in supervisor._records
         return DiagnosticSnapshot(
-            checks=checks(listener="warn", e2e="ok"),
-            remote_listener=RemoteListener(found=True),
+            checks=checks(listener="warn" if managed else "ok", e2e="ok" if managed else "unknown"),
+            remote_listener=RemoteListener(found=managed),
             autossh_path="/opt/homebrew/bin/autossh",
             network_ok=True,
             ssh_auth_ok=True,
-            end_to_end_known=True,
-            end_to_end_ok=True,
+            end_to_end_known=managed,
+            end_to_end_ok=managed,
         )
+
+    async def fake_spawn(tunnel, _autossh_path):
+        record = ProcessRecord(
+            tunnel_id=tunnel.id,
+            autossh_pid=12345,
+            pgid=12345,
+            started_at="2026-11-04T00:00:00+00:00",
+            process_signature="test",
+            args_hash="test",
+            autossh_path="/opt/homebrew/bin/autossh",
+            marker=marker_for(tunnel.id),
+        )
+        supervisor._records[tunnel.id] = record
+        return record
 
     original_publish = app.state.broker.publish
 
@@ -480,6 +501,9 @@ def test_background_monitor_auto_connects_without_click(test_settings: Settings,
     monkeypatch.setattr(app.state.diagnostics, "quick_network_ok", fake_network)
     monkeypatch.setattr(app.state.diagnostics, "run", fake_run)
     monkeypatch.setattr(app.state.broker, "publish", publish)
+    monkeypatch.setattr(supervisor, "_spawn_autossh", fake_spawn)
+    monkeypatch.setattr("backend.app.supervisor.find_ssh_pid", lambda record: record.autossh_pid + 1)
+    monkeypatch.setattr("backend.app.supervisor.verify_record", lambda record: supervisor._records.get(record.tunnel_id) == record)
 
     with TestClient(app) as client:
         tunnel_id = client.get("/api/tunnels").json()[0]["tunnel"]["id"]
@@ -519,7 +543,8 @@ def test_manual_stop_prevents_auto_connection_after_app_restart(test_settings: S
 
         monkeypatch.setattr(restarted.state.diagnostics, "run", healthy_external)
         started = client.post(f"/api/tunnels/{tunnel_id}/start")
-        assert started.json()["runtime"]["state"] == "connected"
+        assert started.json()["runtime"]["state"] == "port_conflict"
+        assert started.json()["runtime"]["external_tunnel"] is False
         with restarted.state.database.session() as session:
             assert session.get(Tunnel, tunnel_id).manually_stopped is False
 

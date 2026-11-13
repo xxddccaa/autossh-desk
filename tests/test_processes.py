@@ -83,9 +83,24 @@ def test_autossh_args_include_marker_keepalive_and_defaults():
     assert "SetEnv=AUTOSSH_DESK_PROFILE=abc-123" in args
     assert "TCPKeepAlive=yes" in args
     assert "ExitOnForwardFailure=yes" in args
+    assert "ControlMaster=no" in args
+    assert "ControlPath=none" in args
+    assert "ControlPersist=no" in args
+    assert "ForkAfterAuthentication=no" in args
+    assert "BatchMode=yes" in args
     assert "127.0.0.1:15432:postgres.example.com:5432" in args
     assert args[-1] == "root@remote.example.com"
     assert not any("password" in arg.lower() for arg in args)
+
+
+def test_diagnostic_ssh_disables_forwarding_and_multiplexing(tmp_path: Path):
+    diagnostics = Diagnostics(Settings(data_dir=tmp_path, frontend_dist=tmp_path))
+    args = diagnostics.ssh_args(sample_tunnel())
+    assert "ClearAllForwardings=yes" in args
+    assert "ControlMaster=no" in args
+    assert "ControlPath=none" in args
+    assert "ControlPersist=no" in args
+    assert "ForkAfterAuthentication=no" in args
 
 
 def test_stop_signals_only_managed_process_group(tmp_path: Path):
@@ -218,7 +233,7 @@ def test_end_to_end_falls_back_when_nc_is_missing(tmp_path: Path):
     diagnostics.run_remote = missing_probe  # type: ignore[method-assign]
     ok, detail = asyncio.run(diagnostics.end_to_end(sample_tunnel()))
     assert ok is None
-    assert "无法执行端到端探测" in detail
+    assert "无法执行 TCP 监听探测" in detail
 
 
 def test_single_instance_lock(tmp_path: Path):

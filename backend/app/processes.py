@@ -68,6 +68,18 @@ def build_autossh_args(tunnel: Tunnel, autossh_path: str) -> list[str]:
         "-o",
         "TCPKeepAlive=yes",
         "-o",
+        "BatchMode=yes",
+        "-o",
+        "ControlMaster=no",
+        "-o",
+        "ControlPath=none",
+        "-o",
+        "ControlPersist=no",
+        "-o",
+        "ForkAfterAuthentication=no",
+        "-o",
+        "ClearAllForwardings=no",
+        "-o",
         f"SetEnv={marker_for(tunnel.id)}",
     ]
     if tunnel.ssh_port:

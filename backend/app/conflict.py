@@ -23,6 +23,7 @@ class StoredPreview:
     created_at: float
     expires_at: datetime
     can_clean: bool
+    tcp_probe_ok: bool
 
 
 def listener_fingerprint(tunnel: Tunnel, listener: RemoteListener) -> str:
@@ -71,11 +72,9 @@ class ConflictService:
             raise ConflictError("远端端口当前未监听，无需清理")
 
         end_to_end_ok, end_to_end_detail = await self.diagnostics.end_to_end(tunnel)
-        if end_to_end_ok is True:
-            raise ConflictError("远端端口可以端到端访问，当前是健康隧道，未提供清理操作")
         if end_to_end_ok is None:
             raise ConflictError(
-                f"无法确认真实链路状态：{end_to_end_detail}。不会提供自动清理。"
+                f"无法确认 TCP 监听状态：{end_to_end_detail}。不会提供自动清理。"
             )
 
         candidates = [
@@ -85,10 +84,12 @@ class ConflictService:
             len(listener.pids) == 1
             and len(candidates) == 1
             and candidates[0].get("pid") == listener.pids[0]
+            and f"{tunnel.remote_bind_host}:{tunnel.remote_port}" in listener.raw.split()
         )
         if can_clean:
             message = (
-                "已确认唯一的 sshd 会话占用该端口。请核对进程信息后再次确认清理。"
+                "已确认唯一的 sshd 会话占用该地址和端口。TCP 可达不代表转发目标正确。"
+                "清理将中断该会话的所有转发，发起端自动重连仍可能重新占用；请核对用途后再次确认。"
             )
         else:
             message = (
@@ -103,6 +104,7 @@ class ConflictService:
             created_at=time.monotonic(),
             expires_at=expires_at,
             can_clean=can_clean,
+            tcp_probe_ok=end_to_end_ok,
         )
         return ConflictPreview(
             tunnel_id=tunnel.id,
@@ -134,6 +136,11 @@ class ConflictService:
             raise ConflictError(f"重新检查远端端口失败：{listener_error}")
         if listener_fingerprint(tunnel, listener) != preview.listener_fingerprint:
             raise ConflictError("远端监听状态已经变化，已取消清理，请重新诊断")
+        end_to_end_ok, end_to_end_detail = await self.diagnostics.end_to_end(tunnel)
+        if end_to_end_ok is None:
+            raise ConflictError(f"无法确认 TCP 监听状态：{end_to_end_detail}。已取消清理。")
+        if end_to_end_ok != preview.tcp_probe_ok:
+            raise ConflictError("远端 TCP 监听状态已经变化，已取消清理，请重新核对用途并确认")
         candidates = [
             process for process in listener.processes if process.get("is_sshd") is True
         ]
@@ -143,14 +150,17 @@ class ConflictService:
         port = tunnel.remote_port
         command = (
             "set -eu; "
-            f'pid={pid}; port={port}; '
-            'self_pid=$$; parent_pid=$PPID; '
+            f'pid={pid}; port={port}; bind_host={tunnel.remote_bind_host}; '
             '[ "$pid" -gt 1 ] || exit 41; '
-            '[ "$pid" -ne "$self_pid" ] && [ "$pid" -ne "$parent_pid" ] || exit 42; '
+            'ancestor=$$; while [ "$ancestor" -gt 1 ]; do '
+            '[ "$pid" -ne "$ancestor" ] || exit 42; '
+            'ancestor=$(ps -o ppid= -p "$ancestor" | tr -d " "); '
+            '[ -n "$ancestor" ] || exit 42; done; '
             'comm=$(ps -o comm= -p "$pid" 2>/dev/null | sed -n "1p"); '
             '[ "${comm##*/}" = sshd ] || exit 43; '
-            'listeners=$(ss -H -ltnp "sport = :$port" 2>/dev/null); '
-            'case "$listeners" in *"pid=$pid"*) ;; *) exit 44;; esac; '
+            'listeners=$(ss -H -ltnp "sport = :$port" 2>/dev/null '
+            '| awk -v endpoint="$bind_host:$port" \'$4 == endpoint {print}\'); '
+            'case "$listeners" in *"pid=$pid,"*|*"pid=$pid)"*) ;; *) exit 44;; esac; '
             'kill -TERM "$pid"'
         )
         result = await self.diagnostics.run_remote(tunnel, command, timeout=12)

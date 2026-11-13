@@ -28,12 +28,12 @@ interface FormState {
 }
 
 const emptyForm: FormState = {
-  name: "新 PostgreSQL 隧道",
+  name: "新隧道",
   ssh_target: "root@remote.example.com",
   ssh_port: "",
   remote_bind_host: "127.0.0.1",
   remote_port: "15432",
-  target_host: "postgres.example.com",
+  target_host: "service.example.com",
   target_port: "5432",
   identity_file: "",
   server_alive_interval: "30",
@@ -174,7 +174,7 @@ export function TunnelFormDialog({ open, tunnel, onOpenChange, onSubmit }: Props
                   className={inputClass}
                   value={form.name}
                   onChange={(event) => update("name", event.target.value)}
-                  placeholder="例如：PostgreSQL Tunnel"
+                  placeholder="例如：内部服务隧道"
                 />
               </div>
               <div>
@@ -313,7 +313,7 @@ export function TunnelFormDialog({ open, tunnel, onOpenChange, onSubmit }: Props
                 checked={form.auto_reconnect}
                 onCheckedChange={(value) => update("auto_reconnect", value)}
                 label="自动重连"
-                description="VPN 网络可达时自动连接，断线后重试"
+                description="网络恢复、断线或端口释放后自动连接"
               />
               <FormSwitch
                 checked={form.auto_start}

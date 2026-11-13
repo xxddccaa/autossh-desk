@@ -10,12 +10,12 @@ from .models import Base, Tunnel
 
 
 DEFAULT_TUNNEL = {
-    "name": "PostgreSQL Tunnel",
+    "name": "示例隧道",
     "ssh_target": "root@remote.example.com",
     "ssh_port": None,
     "remote_bind_host": "127.0.0.1",
     "remote_port": 15432,
-    "target_host": "postgres.example.com",
+    "target_host": "service.example.com",
     "target_port": 5432,
     "identity_file": None,
     "server_alive_interval": 30,

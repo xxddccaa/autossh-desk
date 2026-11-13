@@ -11,8 +11,8 @@ import {
   Clipboard,
   Clock3,
   Copy,
-  Database,
   Globe2,
+  Info,
   KeyRound,
   Layers3,
   LoaderCircle,
@@ -41,6 +41,7 @@ import {
 } from "react";
 import { ConflictDialog } from "./components/ConflictDialog";
 import { DeleteDialog } from "./components/DeleteDialog";
+import { RemoteSetupPanel } from "./components/RemoteSetupPanel";
 import { StatusBadge, StatusDot } from "./components/StatusBadge";
 import { TunnelFormDialog } from "./components/TunnelFormDialog";
 import { useLiveEvents } from "./hooks/useLiveEvents";
@@ -56,7 +57,7 @@ import {
 } from "./lib/api";
 import {
   copyText,
-  dbeaverText,
+  connectionText,
   elapsedSince,
   formatDuration,
   formatTime,
@@ -109,7 +110,13 @@ function checkTone(state: CheckState): {
 function CheckCard({ check }: { check: CheckResult }) {
   const tone = checkTone(check.state);
   return (
-    <div className={`flex min-h-[92px] gap-3 rounded-2xl border p-4 ${tone.className}`}>
+    <div
+      role="group"
+      aria-label={`${check.label}：${check.state === "ok" ? "通过" : check.state === "warn" ? "待确认" : check.state === "fail" ? "失败" : "等待检查"}`}
+      data-testid={`check-${check.key}`}
+      data-state={check.state}
+      className={`flex min-h-[92px] gap-3 rounded-2xl border p-4 ${tone.className}`}
+    >
       <div className="mt-0.5 flex h-7 w-7 shrink-0 items-center justify-center rounded-full bg-white shadow-sm">
         {tone.icon}
       </div>
@@ -279,7 +286,7 @@ function EmptyState({ onCreate }: { onCreate: () => void }) {
           建立第一条反向隧道
         </h2>
         <p className="mt-2 text-sm leading-6 text-[#728078]">
-          配置 SSH 端点、远端监听端口与目标数据库，AutoSSH Desk 会负责启动检查和进程管理。
+          配置 SSH 端点、远端监听端口与目标服务，AutoSSH Desk 会负责启动检查和进程管理。
         </p>
         <button
           type="button"
@@ -498,10 +505,10 @@ export default function App() {
       return "已复制配置，并分配了新的远端端口";
     });
   };
-  const copyDbeaver = () => {
+  const copyConnection = () => {
     if (!selected) return;
-    void copyText(dbeaverText(selected.tunnel)).then(
-      () => notify("DBeaver / SSH 命令行参数已复制", "success"),
+    void copyText(connectionText(selected.tunnel)).then(
+      () => notify("服务连接参数 / SSH 命令已复制", "success"),
       () => notify("复制失败，请检查浏览器剪贴板权限", "error"),
     );
   };
@@ -664,7 +671,7 @@ export default function App() {
                     <StatusBadge state={selectedState} />
                     {selected.runtime.external_tunnel ? (
                       <span className="rounded-full border border-[#d9e2d9] bg-[#f1f5ef] px-2.5 py-1 text-[10px] font-semibold text-[#67766b]">
-                        外部健康隧道
+                        非受管监听
                       </span>
                     ) : null}
                     {selected.runtime.managed ? (
@@ -683,6 +690,12 @@ export default function App() {
                       ? selected.runtime.last_error
                       : selected.runtime.activity || meta.description}
                   </p>
+                  {selected.tunnel.auto_reconnect && selected.runtime.next_retry_at ? (
+                    <p className="mt-2 flex items-center gap-1.5 text-xs font-medium text-[#587462]">
+                      <RefreshCw size={12} /> 自动保持连接 · 下次重试：
+                      {formatTime(selected.runtime.next_retry_at)}，无需手动启动。
+                    </p>
+                  ) : null}
                 </div>
 
                 <div className="flex max-w-[520px] flex-wrap justify-end gap-2">
@@ -730,7 +743,7 @@ export default function App() {
                 </div>
               </div>
 
-              <div className="mt-6 flex items-center gap-3 rounded-2xl border border-[#e5eae3] bg-[#f5f8f3] px-4 py-3.5">
+              <div className="mt-6 flex flex-wrap items-center gap-3 rounded-2xl border border-[#e5eae3] bg-[#f5f8f3] px-4 py-3.5">
                 <div className="flex items-center gap-2 text-xs font-semibold text-[#33483b]">
                   <Server size={15} className="text-[#62816e]" /> Mac
                 </div>
@@ -741,21 +754,21 @@ export default function App() {
                 </div>
                 <ArrowRight size={14} className="text-[#9eaba2]" />
                 <div className="text-xs font-medium text-[#52655a]">
-                  <span className="text-[#91a097]">远端主机 </span>
+                  <span className="text-[#91a097]">远端监听 </span>
                   <span className="font-mono">
                     {selected.tunnel.remote_bind_host}:{selected.tunnel.remote_port}
                   </span>
                 </div>
                 <ArrowRight size={14} className="text-[#9eaba2]" />
-                <div className="min-w-0 flex-1 truncate text-xs font-medium text-[#52655a]">
-                  <span className="text-[#91a097]">目标数据库 </span>
-                  <span className="font-mono">
+                <div className="min-w-0 flex-1 text-xs font-medium text-[#52655a]">
+                  <span className="text-[#91a097]">目标服务 </span>
+                  <span className="break-all font-mono">
                     {selected.tunnel.target_host}:{selected.tunnel.target_port}
                   </span>
                 </div>
                 <button
                   type="button"
-                  onClick={copyDbeaver}
+                  onClick={copyConnection}
                   className="inline-flex shrink-0 items-center gap-1.5 rounded-lg border border-[#d9e1d8] bg-white px-3 py-1.5 text-[11px] font-semibold text-[#587062] hover:bg-[#edf2eb]"
                 >
                   <Copy size={12} /> 连接参数
@@ -768,7 +781,7 @@ export default function App() {
                 <div className="mb-4 flex items-center justify-between">
                   <div>
                     <h2 className="text-base font-semibold tracking-[-0.01em] text-[#203429]">完整链路检查</h2>
-                    <p className="mt-1 text-xs text-[#809087]">从 DNS、TCP、SSH 认证到远端端口和端到端探测</p>
+                    <p className="mt-1 text-xs text-[#809087]">检查 DNS、目标 TCP、SSH 认证与远端监听；服务协议需另行验证</p>
                   </div>
                   <button
                     type="button"
@@ -847,6 +860,8 @@ export default function App() {
                 </div>
               </section>
             </div>
+
+            <RemoteSetupPanel tunnel={selected.tunnel} onNotify={notify} />
 
             <div className="grid grid-cols-[minmax(0,1.7fr)_minmax(310px,0.8fr)] gap-5">
               <section className="overflow-hidden rounded-[24px] border border-[#d9e1d9] bg-[#18241e] shadow-[0_12px_40px_rgba(20,35,27,0.12)]">
@@ -936,7 +951,7 @@ export default function App() {
                 <div className="mt-4 grid grid-cols-2 gap-2">
                   <button
                     type="button"
-                    onClick={copyDbeaver}
+                    onClick={copyConnection}
                     className="flex h-9 items-center justify-center gap-1.5 rounded-lg border border-[#dce3da] bg-white text-xs font-semibold text-[#52665a] hover:bg-[#f2f5ef]"
                   >
                     <Copy size={13} /> 复制参数
@@ -952,7 +967,11 @@ export default function App() {
                 <div className="mt-3 flex items-center gap-2 rounded-xl border border-[#e6ebe4] bg-[#f6f8f4] px-3 py-2.5 text-[11px] text-[#718078]">
                   <Globe2 size={13} /> 远端监听
                   <span className="ml-auto font-mono text-[#3e5546]">
-                    {selected.runtime.remote_listener.found ? "占用 / 已监听" : "不占用 / 空闲"}
+                    {selected.runtime.remote_listener.found
+                      ? selectedState === "connected" && selected.runtime.managed
+                        ? "受管 / 已建立"
+                        : "已监听 / 待确认"
+                      : "未监听 / 空闲"}
                   </span>
                 </div>
               </section>
@@ -1001,7 +1020,7 @@ export default function App() {
             ) : toast.tone === "error" ? (
               <AlertCircle size={16} className="mt-0.5" />
             ) : (
-              <Database size={16} className="mt-0.5" />
+              <Info size={16} className="mt-0.5" />
             )}
             <span className="leading-5">{toast.message}</span>
           </div>

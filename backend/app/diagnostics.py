@@ -33,6 +33,33 @@ class CommandResult:
         return redact_text(text) or f"退出码 {self.code}"
 
 
+def ssh_failure_is_retryable(result: CommandResult) -> bool:
+    if result.ok:
+        return False
+    if result.timed_out:
+        return True
+    message = f"{result.stderr}\n{result.stdout}".lower()
+    return not any(
+        error in message
+        for error in (
+            "permission denied",
+            "no such identity",
+            "host key verification failed",
+            "remote host identification has changed",
+            "too many authentication failures",
+            "no supported authentication methods",
+            "bad configuration option",
+            "bad owner or permissions",
+            "unprotected private key file",
+            "invalid format",
+            "incorrect passphrase",
+            "no matching host key type",
+            "no matching key exchange method",
+            "no matching cipher",
+        )
+    )
+
+
 async def run_command(
     args: list[str],
     timeout: float,
@@ -80,6 +107,7 @@ class SSHConfig:
     hostname: str
     port: int
     user: str | None = None
+    configured_forwards: list[str] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -92,6 +120,7 @@ class DiagnosticSnapshot:
     ssh_config: SSHConfig | None = None
     network_ok: bool = False
     ssh_auth_ok: bool = False
+    ssh_failure_retryable: bool = False
     error: str | None = None
 
     @property
@@ -113,7 +142,7 @@ class Diagnostics:
         return shutil.which("autossh")
 
     async def resolve_ssh(self, tunnel: Tunnel) -> tuple[SSHConfig | None, str | None]:
-        args = [self.settings.ssh_executable, "-G"]
+        args = [self.settings.ssh_executable, "-G", "-o", "ClearAllForwardings=no"]
         if tunnel.ssh_port:
             args.extend(["-p", str(tunnel.ssh_port)])
         if tunnel.identity_file:
@@ -123,9 +152,12 @@ class Diagnostics:
         if not result.ok:
             return None, result.message
         values: dict[str, str] = {}
+        configured_forwards: list[str] = []
         for line in result.stdout.splitlines():
             key, _, value = line.partition(" ")
             values[key] = value.strip()
+            if key in {"localforward", "remoteforward", "dynamicforward"}:
+                configured_forwards.append(key)
         hostname = values.get("hostname")
         if not hostname:
             return None, "SSH 配置中没有可解析的 hostname"
@@ -137,13 +169,27 @@ class Diagnostics:
             hostname=hostname,
             port=port,
             user=values.get("user") or None,
+            configured_forwards=configured_forwards,
         ), None
 
     def ssh_args(self, tunnel: Tunnel) -> list[str]:
         args = [
             self.settings.ssh_executable,
+            "-T",
             "-o",
             "BatchMode=yes",
+            "-o",
+            "ClearAllForwardings=yes",
+            "-o",
+            "ControlMaster=no",
+            "-o",
+            "ControlPath=none",
+            "-o",
+            "ControlPersist=no",
+            "-o",
+            "ForkAfterAuthentication=no",
+            "-o",
+            "RemoteCommand=none",
             "-o",
             f"ConnectTimeout={tunnel.connect_timeout}",
             "-o",
@@ -314,9 +360,12 @@ class Diagnostics:
         )
         result = await self.run_remote(tunnel, command, timeout=8)
         if result.ok:
-            return True, f"远端 {connect_host}:{tunnel.remote_port} 可以建立 TCP 连接"
+            return True, (
+                f"远端 {connect_host}:{tunnel.remote_port} 接受 TCP 连接；"
+                "仅验证监听，未验证转发目标或服务协议"
+            )
         if result.code == 127 or "AUTOSSH_DESK_NO_TCP_PROBE" in result.stderr:
-            return None, "远端缺少 nc、bash /dev/tcp 和 python3，无法执行端到端探测"
+            return None, "远端缺少 nc、bash /dev/tcp 和 python3，无法执行 TCP 监听探测"
         return False, result.message
 
     async def run(self, tunnel: Tunnel) -> DiagnosticSnapshot:
@@ -352,7 +401,7 @@ class Diagnostics:
             snapshot.checks.append(
                 CheckResult(
                     key="target_tcp",
-                    label="目标数据库端口",
+                    label="目标服务端口",
                     state="unknown",
                     detail="DNS 检查未通过",
                 )
@@ -364,14 +413,14 @@ class Diagnostics:
             snapshot.checks.append(
                 CheckResult(
                     key="target_tcp",
-                    label="目标数据库端口",
+                    label="目标服务端口",
                     state="ok" if target_ok else "fail",
                     detail=detail,
                     latency_ms=latency,
                 )
             )
             if not target_ok:
-                snapshot.error = "目标数据库不可达"
+                snapshot.error = "目标服务不可达"
 
         ssh_config, ssh_error = await self.resolve_ssh(tunnel)
         snapshot.ssh_config = ssh_config
@@ -393,6 +442,23 @@ class Diagnostics:
                     detail="SSH 配置解析失败",
                 )
             )
+            return snapshot
+
+        forwarding_ok = not ssh_config.configured_forwards
+        snapshot.checks.append(
+            CheckResult(
+                key="ssh_forwarding",
+                label="SSH 转发隔离",
+                state="ok" if forwarding_ok else "fail",
+                detail=(
+                    "SSH 别名未配置额外转发"
+                    if forwarding_ok
+                    else "SSH 别名包含额外转发，请使用不含 LocalForward、RemoteForward 或 DynamicForward 的专用别名"
+                ),
+            )
+        )
+        if not forwarding_ok:
+            snapshot.error = snapshot.check("ssh_forwarding").detail
             return snapshot
 
         ssh_ok, latency, detail = await self._tcp_check(
@@ -421,16 +487,17 @@ class Diagnostics:
 
         auth = await self.run_remote(tunnel, "true", timeout=min(tunnel.connect_timeout + 3, 20))
         snapshot.ssh_auth_ok = auth.ok
+        snapshot.ssh_failure_retryable = ssh_failure_is_retryable(auth)
         snapshot.checks.append(
             CheckResult(
                 key="ssh_auth",
-                label="SSH 认证",
+                label="SSH 连接" if snapshot.ssh_failure_retryable else "SSH 认证",
                 state="ok" if auth.ok else "fail",
                 detail="认证成功" if auth.ok else auth.message,
             )
         )
         if not auth.ok:
-            snapshot.error = "SSH 认证失败"
+            snapshot.error = "SSH 连接暂时失败" if snapshot.ssh_failure_retryable else "SSH 认证失败"
             return snapshot
 
         listener, listener_error = await self.remote_listener(tunnel)
@@ -459,7 +526,7 @@ class Diagnostics:
             snapshot.checks.append(
                 CheckResult(
                     key="end_to_end",
-                    label="远端端到端 TCP",
+                    label="远端监听 TCP（目标未验证）",
                     state=(
                         "ok"
                         if end_to_end_ok is True
@@ -474,7 +541,7 @@ class Diagnostics:
             snapshot.checks.append(
                 CheckResult(
                     key="end_to_end",
-                    label="远端端到端 TCP",
+                    label="远端监听 TCP（目标未验证）",
                     state="unknown",
                     detail="远端端口未监听",
                 )

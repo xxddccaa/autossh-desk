@@ -35,7 +35,7 @@ class Tunnel(Base):
     remote_bind_host: Mapped[str] = mapped_column(String(255), default="127.0.0.1")
     remote_port: Mapped[int] = mapped_column(Integer, default=15432)
     target_host: Mapped[str] = mapped_column(
-        String(255), default="postgres.example.com"
+        String(255), default="service.example.com"
     )
     target_port: Mapped[int] = mapped_column(Integer, default=5432)
     identity_file: Mapped[str | None] = mapped_column(String(1024), nullable=True)

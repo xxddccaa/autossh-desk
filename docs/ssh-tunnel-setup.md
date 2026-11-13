@@ -91,7 +91,7 @@ ssh -o BatchMode=yes tunnel-host "lsof -nP -iTCP:15432 -sTCP:LISTEN"
 ssh -o BatchMode=yes tunnel-host "ss -ltnp 'sport = :15432'"
 ```
 
-再验证端到端 TCP：
+再验证远端监听 TCP（这不能证明实际转发目标或服务协议正确）：
 
 ```bash
 ssh -o BatchMode=yes tunnel-host "nc -z -w 4 127.0.0.1 15432"
@@ -100,17 +100,62 @@ ssh -o BatchMode=yes tunnel-host "nc -z -w 4 127.0.0.1 15432"
 如果目标是 HTTPS，可进一步验证：
 
 ```bash
-ssh -o BatchMode=yes tunnel-host "curl -skI --max-time 8 https://127.0.0.1:15432/"
+ssh -o BatchMode=yes tunnel-host "curl --noproxy '*' --connect-to target.example.com:443:127.0.0.1:15432 --max-time 8 -I https://target.example.com/"
 ```
 
-其他协议使用对应的客户端验证。
+此命令保留目标域名的 SNI 和证书验证，不使用 `-k`。其他协议使用对应的客户端验证。
+
+AutoSSH Desk 不会仅凭 TCP 可达复用非受管监听。诊断 SSH 会清空额外转发并禁用连接复用、后台持久会话；受管隧道使用独立 SSH 连接。若别名配置了 `LocalForward`、`RemoteForward` 或 `DynamicForward`，启动检查会拒绝它，请创建保留主机、认证和代理配置但不含额外转发的专用别名。
+
+### 5. 按需配置远端 socat 和 hosts
+
+每条隧道详情页的“远端服务器操作”会按当前配置生成可复制的建议指令。应用不会执行这些命令，也不会修改任何主机的 `/etc/hosts`。已有隧道配置不会被自动改写。
+
+这些操作用于让远端客户端继续使用目标域名和原服务端口，并非建立 SSH 隧道的必要条件。先确认隧道已连接，再登录 SSH 远端主机执行，不要在运行 autossh 的本机修改这些映射。
+
+以远端监听 `127.0.0.1:18443`、目标 `service.example.com:443` 为例：
+
+1. 检查远端已安装 socat，并核对入口地址和端口是否空闲，不要终止不明占用进程：
+
+   ```bash
+   command -v socat
+   sudo ss -ltnp 'sport = :443'
+   ```
+
+2. 在远端启动只绑定回环地址的 socat：
+
+   ```bash
+   sudo socat 'TCP4-LISTEN:443,bind=127.1.72.11,reuseaddr,fork' 'TCP4:127.0.0.1:18443'
+   ```
+
+   页面使用 `127.1.<监听端口高字节>.<监听端口低字节>` 作为建议入口，避免不同监听端口对应的多个 443 服务争用同一入口。它不保证该地址尚未被其他服务使用；相同监听端口、不同绑定地址的配置也可能需要手工选择不同入口。若已有地址规划，同步替换 socat 和 hosts 中的回环地址。
+
+   Linux 通常可直接使用此回环地址；远端为 macOS 时先运行 `sudo ifconfig lo0 alias 127.1.72.11`。不要把 socat 绑定改为 `0.0.0.0`，除非已明确评估对外开放的影响。该命令前台运行，Ctrl+C 停止；长期使用应由远端服务管理器托管，AutoSSH Desk 不负责远端 socat 的启停或重启。
+
+3. 另开远端 SSH 终端，备份并编辑 hosts：
+
+   ```bash
+   sudo cp -p /etc/hosts "/etc/hosts.autossh-desk.$(date +%Y%m%d-%H%M%S).bak"
+   sudoedit /etc/hosts
+   ```
+
+   添加或核对并替换该域名的记录，保留其他域名和系统记录，不要重复追加：
+
+   ```text
+   127.1.72.11 service.example.com
+   ```
+
+   以 root 登录且未安装 sudo 时可省略 sudo，并使用 `vi /etc/hosts` 编辑。目标为 IP 地址或 localhost 时页面不会生成 hosts 映射；这些情况下直接让客户端使用建议服务入口。
+
+远端客户端随后使用原域名和原端口；HTTPS 保留域名进行 SNI 和证书验证，不使用 `-k`。真正目标仍由运行 autossh 的本机解析连接，不会因仅修改远端 hosts 而改为连接远端回环地址。撤销时停止对应 socat，并仅移除本次 hosts 映射。TCP 可达和绿色监听检查仍不能替代实际服务协议验证。
 
 ## 常见错误
 
 | 现象 | 优先检查 |
 | --- | --- |
 | “SSH 不可达”或“远端 SSH 不可达” | `ssh -G <alias>` 的 HostName/Port 是否正确；`ssh <alias> true` 是否成功；别名是否已失效 |
-| 认证失败 | 用户、密钥路径、SSH Agent/Keychain、`IdentityFile` |
+| 明确的认证拒绝或密钥错误 | 用户、密钥路径、SSH Agent/Keychain、`IdentityFile`；修正后重新启动 |
+| SSH 连接重置、握手超时或仅有非零退出码 | 临时 SSH 会话失败，不能据此认定密钥错误；开启自动重连后持续退避重试 |
 | `remote port forwarding failed` | 远端监听端口被占用；按 `docs/remote-port-conflict.md` 处理 |
 | 本机目标 DNS 解析失败 | 本机 VPN、DNS、路由；`ssh -R` 的目标由本机解析 |
 | 目标 TCP 不通 | 本机到目标服务的 VPN、防火墙或路由 |

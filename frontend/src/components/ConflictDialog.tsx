@@ -30,9 +30,11 @@ export function ConflictDialog({
   const [preview, setPreview] = useState<ConflictPreview | null>(null);
   const [loading, setLoading] = useState(false);
   const [cleaning, setCleaning] = useState(false);
+  const [acknowledged, setAcknowledged] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const inspect = useCallback(async () => {
+    setAcknowledged(false);
     if (!status) return;
     setLoading(true);
     setError(null);
@@ -51,11 +53,12 @@ export function ConflictDialog({
     if (!open) {
       setPreview(null);
       setError(null);
+      setAcknowledged(false);
     }
   }, [inspect, open]);
 
   const clean = async () => {
-    if (!status || !preview?.can_clean) return;
+    if (!status || !preview?.can_clean || !acknowledged) return;
     setCleaning(true);
     setError(null);
     try {
@@ -82,8 +85,8 @@ export function ConflictDialog({
         <div className="flex items-start gap-3 rounded-2xl border border-[#ecd7a9] bg-[#fff9ea] p-4 text-[#76571d]">
           <ShieldAlert size={20} className="mt-0.5 shrink-0" />
           <div className="text-sm leading-6">
-            先重新读取监听 PID、进程名和命令行，再核验端到端连接。无法唯一确认 sshd
-            时会禁止自动清理并给出手工命令。
+            先重新读取监听 PID、进程名和命令行，再检查 TCP 监听。TCP 可达不能验证转发目标；
+            清理会中断该 sshd 会话的全部转发。无法唯一确认 sshd 时会禁止清理并给出手工命令。
           </div>
         </div>
 
@@ -111,15 +114,15 @@ export function ConflictDialog({
               </div>
               <div className="rounded-xl border border-[#e1e6df] bg-[#f8faf7] p-4">
                 <div className="text-[11px] font-semibold tracking-wide text-[#819087] uppercase">
-                  端到端 TCP
+                  TCP 监听
                 </div>
                 <div
                   className={`mt-2 inline-flex items-center gap-1.5 text-sm font-semibold ${
-                    preview.end_to_end_ok ? "text-[#34724b]" : "text-[#ae4141]"
+                    preview.end_to_end_ok ? "text-[#9a7422]" : "text-[#ae4141]"
                   }`}
                 >
                   {preview.end_to_end_ok ? <Check size={15} /> : <AlertTriangle size={15} />}
-                  {preview.end_to_end_ok ? "成功" : "失败 / 超时"}
+                  {preview.end_to_end_ok ? "可达，目标未验证" : "失败 / 超时"}
                 </div>
               </div>
               <div className="rounded-xl border border-[#e1e6df] bg-[#f8faf7] p-4">
@@ -211,6 +214,17 @@ export function ConflictDialog({
             <div className="rounded-xl border border-[#efcaca] bg-[#fff8f8] p-4 text-sm leading-6 text-[#854141]">
               {preview.message}
             </div>
+            {preview.can_clean ? (
+              <label className="flex items-start gap-3 text-sm leading-6 text-[#854141]">
+                <input
+                  type="checkbox"
+                  checked={acknowledged}
+                  onChange={(event) => setAcknowledged(event.target.checked)}
+                  className="mt-1"
+                />
+                我已核对用途，确认终止该 sshd 会话的全部转发
+              </label>
+            ) : null}
           </>
         ) : null}
       </div>
@@ -234,7 +248,7 @@ export function ConflictDialog({
           </button>
           <button
             type="button"
-            disabled={!preview?.can_clean || loading || cleaning}
+            disabled={!preview?.can_clean || !acknowledged || loading || cleaning}
             onClick={() => void clean()}
             className="inline-flex h-10 items-center gap-2 rounded-xl bg-[#a73c3c] px-5 text-sm font-semibold text-white shadow-sm transition hover:bg-[#933333] disabled:cursor-not-allowed disabled:bg-[#d9c4c4]"
           >
